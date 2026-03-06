@@ -1,0 +1,29 @@
+# Python Environments
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# Security (CRITICAL)
+.env
+.streamlit/secrets.toml
+
+# Logs & App Outputs
+app.log
+*.xlsx
+*.csv
+*.json
+!core/config.py  # Keep config but ignore loose json files
+
+# Image & Document Uploads (Preventing bloat)
+*.pdf
+*.jpg
+*.jpeg
+*.png
+
+# OS System Files
+.DS_Store
+Thumbs.db
+
+prompt.txt
