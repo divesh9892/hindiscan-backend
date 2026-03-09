@@ -57,10 +57,7 @@ async def extract_document(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
-    # --- 1. AUTH & BILLING CHECK ---
-    # Fetch our dev user (Later, this will be extracted from the Clerk JWT token)
-    user = await crud.get_or_create_dev_user(db)
-    
+    # --- 1. BILLING CHECK ---
     # Do they have enough credits? If not, stop immediately.
     if user.credit_balance < 1:
         raise HTTPException(status_code=402, detail="Insufficient credits. Please top up your balance.")

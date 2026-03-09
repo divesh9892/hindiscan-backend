@@ -2,11 +2,35 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import patch, AsyncMock
+from app.core.security import get_current_user
+from app.db.models import User
+from unittest.mock import AsyncMock, MagicMock, patch
+from app.db.database import get_db  
 
 # Import your FastAPI app
 from app.main import app
 # Create a test client that acts like a browser
 client = TestClient(app)
+
+# 🚀 SECURITY BYPASS: Fake the Clerk User
+def mock_get_current_user():
+    return User(id=999, clerk_id="test_robot_123", email="robot@hindiscan.com", credit_balance=10)
+
+# 🚀 DATABASE BYPASS: Fake the Database Session
+async def mock_get_db():
+    mock_db = AsyncMock()
+    # Tell the mock that .add() is synchronous, so it stops throwing warnings!
+    mock_db.add = MagicMock() 
+    yield mock_db
+
+# Apply both overrides to the testing app
+app.dependency_overrides[get_current_user] = mock_get_current_user
+app.dependency_overrides[get_db] = mock_get_db
+
+@pytest.fixture(autouse=True)
+def bypass_billing_for_api_tests():
+    with patch("app.api.v1.endpoints.extract.crud.log_and_bill_extraction", new_callable=AsyncMock) as mock_billing:
+        yield mock_billing
 
 @pytest.fixture
 def dummy_image_bytes():
@@ -63,7 +87,7 @@ def test_extract_endpoint_success(mock_init, mock_process_document, dummy_image_
     assert "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in response.headers["content-type"]
     
     # Check if the filename from our mock JSON was used
-    assert "MockTestReport.xlsx" in response.headers["content-disposition"]
+    assert "Mock_Test_Report.xlsx" in response.headers["content-disposition"]
     
     # Verify our mock was actually called
     mock_process_document.assert_called_once()
