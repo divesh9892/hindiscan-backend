@@ -11,10 +11,11 @@ app = FastAPI(
 # Configure CORS so the Next.js frontend can communicate with this backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"], # We will add production domains later
+    allow_origins=["http://localhost:10001"], # We will add production domains later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"]
 )
 
 # Wire up the V1 API Router
