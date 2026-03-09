@@ -4,7 +4,7 @@ from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy.exc import IntegrityError # 🚀 ADD THIS IMPORT
+from sqlalchemy.exc import IntegrityError
 from clerk_backend_api import Clerk
 
 from app.db.database import get_db
@@ -42,8 +42,6 @@ async def get_current_user(
 
     if not user:
         try:
-            # Note: For production, using async httpx to call Clerk's API is faster, 
-            # but the synchronous Clerk SDK is perfectly fine for MVP user creation.
             clerk_user_info = clerk_client.users.get(user_id=clerk_id)
             email = clerk_user_info.email_addresses[0].email_address
         except Exception as e:
@@ -55,27 +53,36 @@ async def get_current_user(
         user = User(clerk_id=clerk_id, email=email, credit_balance=3)
         db.add(user)
         
-        tx = CreditTransaction(
-            user_id=user.id, 
-            amount=3, 
-            transaction_type="signup_bonus",
-            reference_id="clerk_signup"
-        )
-        db.add(tx)
-        
         try:
-            # Attempt to save the user and credits
+            # 🚀 FLUSH FIRST: This talks to the DB to get the user.id. 
+            # If a race condition happens, it throws the IntegrityError right here.
+            await db.flush() 
+            
+            # Now user.id safely exists, so we can log the signup bonus
+            tx = CreditTransaction(
+                user_id=user.id, 
+                amount=3, 
+                transaction_type="signup_bonus",
+                reference_id="clerk_signup"
+            )
+            db.add(tx)
+            
+            # Commit everything permanently
             await db.commit()
             await db.refresh(user)
+            
         except IntegrityError:
-            # 🚀 RACE CONDITION CAUGHT!
-            # Another request just created this user. Rollback our attempt.
+            # 🚀 RACE CONDITION CAUGHT SAFELY
             await db.rollback()
             log.warning(f"Concurrent registration caught for {email}. Fetching existing user.")
             
-            # Re-fetch the newly created user
+            # Re-fetch the user that the other parallel request successfully created
             result = await db.execute(select(User).where(User.clerk_id == clerk_id))
             user = result.scalars().first()
+            
+            # Absolute safety net to prevent returning None
+            if not user:
+                raise HTTPException(status_code=401, detail="Authentication collision. Please try again.")
 
     return user
 
@@ -90,11 +97,9 @@ async def get_admin_user(
     token = credentials.credentials
     
     try:
-        # Decode the token locally
         payload = jwt.decode(token, key=CLERK_PUBLIC_KEY, algorithms=["RS256"])
         clerk_id = payload.get("sub")
         
-        # 🚀 CHECK THE METADATA WE JUST ADDED IN THE DASHBOARD
         public_metadata = payload.get("public_metadata", {})
         if public_metadata.get("role") != "admin":
             log.warning(f"Unauthorized admin access attempt by {clerk_id}")
@@ -103,7 +108,6 @@ async def get_admin_user(
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid authentication token.")
 
-    # Fetch the user from the database
     result = await db.execute(select(User).where(User.clerk_id == clerk_id))
     user = result.scalars().first()
     
