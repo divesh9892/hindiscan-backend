@@ -77,7 +77,7 @@ class AIExtractor:
 
         for idx, img_bytes in enumerate(images_to_process):
             if progress_callback:
-                progress_callback(idx, len(images_to_process))
+                progress_callback(idx+1, len(images_to_process))
                 
             log.info(f"Sending Page {idx + 1} to {self.model_name}...")
             document_part = types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
