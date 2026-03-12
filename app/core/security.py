@@ -63,7 +63,7 @@ async def get_current_user(
                 user_id=user.id, 
                 amount=3, 
                 transaction_type="signup_bonus",
-                reference_id="clerk_signup"
+                reference_id="signup_bonus"
             )
             db.add(tx)
             
@@ -92,22 +92,34 @@ async def get_admin_user(
 ) -> User:
     """
     Strict Admin Gatekeeper. 
-    Verifies the token, checks for the Admin cryptographic tag, and returns the DB user.
+    Verifies the token, fetches the live user profile from Clerk, and checks for the Admin tag.
     """
     token = credentials.credentials
     
     try:
+        # 1. Verify the cryptographic signature of the token
         payload = jwt.decode(token, key=CLERK_PUBLIC_KEY, algorithms=["RS256"])
         clerk_id = payload.get("sub")
         
-        public_metadata = payload.get("public_metadata", {})
-        if public_metadata.get("role") != "admin":
-            log.warning(f"Unauthorized admin access attempt by {clerk_id}")
-            raise HTTPException(status_code=403, detail="Forbidden. Enterprise Admin access required.")
+        # 2. Fetch the LIVE user profile from Clerk to get the metadata
+        try:
+            clerk_user_info = clerk_client.users.get(user_id=clerk_id)
+            # Clerk SDK returns public_metadata as a dictionary
+            metadata = clerk_user_info.public_metadata or {}
+            
+            if metadata.get("role") != "admin":
+                log.warning(f"Unauthorized admin access attempt by {clerk_id}")
+                raise HTTPException(status_code=403, detail="Forbidden. Enterprise Admin access required.")
+        except Exception as e:
+            if isinstance(e, HTTPException):
+                raise e
+            log.error(f"Clerk API error verifying admin: {str(e)}")
+            raise HTTPException(status_code=403, detail="Forbidden. Admin verification failed.")
             
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid authentication token.")
 
+    # 3. Fetch and return the Database User
     result = await db.execute(select(User).where(User.clerk_id == clerk_id))
     user = result.scalars().first()
     
