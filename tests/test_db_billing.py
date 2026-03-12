@@ -47,7 +47,7 @@ async def test_dev_user_creation(db_session):
 
 @pytest.mark.asyncio
 async def test_successful_extraction_billing(db_session):
-    """Proves a successful extraction deducts exactly 1 credit and logs all receipts."""
+    """Proves a successful extraction deducts exactly 1 credit PER PAGE and logs all receipts."""
     user = await crud.get_or_create_dev_user(db_session)
     
     await crud.log_and_bill_extraction(
@@ -60,7 +60,7 @@ async def test_successful_extraction_billing(db_session):
     
     # 1. Did the balance drop?
     updated_user = await db_session.get(User, user.id)
-    assert updated_user.credit_balance == 2
+    assert updated_user.credit_balance == 1
     
     # 2. Was the extraction receipt created?
     result_logs = await db_session.execute(select(ExtractionLog).where(ExtractionLog.user_id == user.id))
@@ -70,10 +70,14 @@ async def test_successful_extraction_billing(db_session):
     assert logs[0].pages_processed == 2
     
     # 3. Was the exact -1 deduction logged in the bank ledger?
-    result_tx = await db_session.execute(select(CreditTransaction).where(CreditTransaction.amount == -1))
+    result_tx = await db_session.execute(
+            select(CreditTransaction)
+            .where(CreditTransaction.user_id == user.id)
+            .where(CreditTransaction.transaction_type == "extraction_deduction")
+        )
     deductions = result_tx.scalars().all()
     assert len(deductions) == 1
-    assert deductions[0].transaction_type == "extraction_deduction"
+    assert deductions[0].amount == -2
 
 @pytest.mark.asyncio
 async def test_failed_extraction_protection(db_session):
@@ -104,3 +108,58 @@ async def test_failed_extraction_protection(db_session):
     result_tx = await db_session.execute(select(CreditTransaction).where(CreditTransaction.amount == -1))
     deductions = result_tx.scalars().all()
     assert len(deductions) == 0
+
+@pytest.mark.asyncio
+async def test_cursor_pagination_logic(db_session):
+    """
+    Proves that the enterprise cursor fetches the exact correct batches 
+    without duplicating or dropping any transactions.
+    """
+    # 1. Create an isolated test user
+    test_user = User(clerk_id="paginator_123", email="page@hindiscan.com", credit_balance=50)
+    db_session.add(test_user)
+    await db_session.flush()
+
+    # 2. Inject exactly 15 transactions
+    for i in range(15):
+        tx = CreditTransaction(
+            user_id=test_user.id,
+            amount=-1,
+            transaction_type="test_deduction",
+            reference_id=f"doc_scan_{i}"
+        )
+        db_session.add(tx)
+    
+    await db_session.commit()
+
+    # 🚀 3. FETCH PAGE 1 (Limit 10)
+    page1, has_more1, next_cursor1 = await crud.get_user_transactions(
+        db=db_session, 
+        user_id=test_user.id, 
+        limit=10
+    )
+    
+    assert len(page1) == 10
+    assert has_more1 is True
+    assert next_cursor1 is not None
+    # Ensure it's sorted newest to oldest (ID descending)
+    assert page1[0].id > page1[-1].id 
+
+    # 🚀 4. FETCH PAGE 2 (Using the cursor from Page 1)
+    page2, has_more2, next_cursor2 = await crud.get_user_transactions(
+        db=db_session, 
+        user_id=test_user.id, 
+        limit=10, 
+        cursor=next_cursor1
+    )
+    
+    assert len(page2) == 5 # 15 total - 10 from page 1 = 5 remaining
+    assert has_more2 is False
+    assert next_cursor2 is None
+
+    # 🚀 5. THE ULTIMATE SECURITY CHECK: Zero Duplication
+    page1_ids = {tx.id for tx in page1}
+    page2_ids = {tx.id for tx in page2}
+    
+    # The intersection of both sets must be completely empty
+    assert len(page1_ids.intersection(page2_ids)) == 0
