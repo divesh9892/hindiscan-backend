@@ -43,11 +43,11 @@ def test_god_mode_success():
     app.dependency_overrides[get_admin_user] = override_get_admin_user_success
     app.dependency_overrides[get_db] = lambda: mock_db
 
-    payload = {"target_email": "target@hindiscan.com", "credits_to_add": 500}
+    payload = {"target_email": "target@hindiscan.com", "credits_to_add": 50}
     response = client.post("/api/v1/admin/grant-god-mode", json=payload)
     
     assert response.status_code == 200
-    assert response.json()["new_balance"] == 505
+    assert response.json()["new_balance"] == 55
 
 def test_god_mode_user_not_found():
     mock_db = AsyncMock()
@@ -62,7 +62,7 @@ def test_god_mode_user_not_found():
     app.dependency_overrides[get_admin_user] = override_get_admin_user_success
     app.dependency_overrides[get_db] = lambda: mock_db
 
-    payload = {"target_email": "ghost_user@hindiscan.com", "credits_to_add": 100}
+    payload = {"target_email": "ghost_user@hindiscan.com", "credits_to_add": 50}
     response = client.post("/api/v1/admin/grant-god-mode", json=payload)
     
     assert response.status_code == 404
@@ -71,7 +71,7 @@ def test_god_mode_user_not_found():
 def test_god_mode_forbidden_access():
     app.dependency_overrides[get_admin_user] = override_get_admin_user_forbidden
 
-    payload = {"target_email": "target@hindiscan.com", "credits_to_add": 500}
+    payload = {"target_email": "target@hindiscan.com", "credits_to_add": 50}
     response = client.post("/api/v1/admin/grant-god-mode", json=payload)
     
     assert response.status_code == 403
