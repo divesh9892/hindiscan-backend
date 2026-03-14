@@ -1,29 +1,51 @@
-# Python Environments
-venv/
-env/
-__pycache__/
-*.pyc
-*.pyo
-
-# Security (CRITICAL)
+# Environments
 .env
-.streamlit/secrets.toml
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
 
-# Logs & App Outputs
+# HindiScan Specific Temp Folders
+hs_*/
+hs_manual_*/
+
+# Python Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing
+.pytest_cache/
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
 app.log
-*.xlsx
-*.csv
-*.json
-!core/config.py  # Keep config but ignore loose json files
-
-# Image & Document Uploads (Preventing bloat)
-*.pdf
-*.jpg
-*.jpeg
-*.png
-
-# OS System Files
-.DS_Store
-Thumbs.db
-
-prompt.txt
