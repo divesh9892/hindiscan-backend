@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Body, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.exc import OperationalError
-from pydantic import EmailStr # 🚀 ADDED: Strict Email Validation
+from pydantic import EmailStr
 
 from app.db.database import get_db
 from app.db.models import User, CreditTransaction
@@ -16,12 +16,8 @@ router = APIRouter()
 @limiter.limit("5/minute")
 async def grant_god_mode(
     request: Request,
-    # 🚀 FIX 1: Reject malformed strings. Must be a valid email format.
     target_email: EmailStr = Body(..., embed=True), 
-    
-    # 🚀 FIX 2: Boundary Enforcement. Must be between 1 and 100. No negatives, no overflows.
-    credits_to_add: int = Body(100, embed=True, gt=0, le=100), 
-    
+    credits_to_add: int = Body(100, embed=True, gt=0, le=100),
     db: AsyncSession = Depends(get_db),
     admin: User = Depends(get_admin_user)
 ):
