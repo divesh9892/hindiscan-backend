@@ -1,10 +1,11 @@
-import os
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import patch, AsyncMock, MagicMock, mock_open
 from app.core.security import get_current_user
 from app.db.models import User
 from app.db.database import get_db  
+import json
+from app.api.v1.endpoints.extract import TASK_STORE
 
 # Import your FastAPI app
 from app.main import app
@@ -93,3 +94,44 @@ def test_extract_endpoint_invalid_file_type():
 
     # 🚀 FIX: Our vault now throws a strict 415 Unsupported Media Type, not a generic 400
     assert response.status_code == 415
+
+
+# 🚀 FIX: Removed the 'client' argument from the function signature!
+def test_get_extracted_json_success():
+    """Proves the JSON endpoint successfully returns parsed data."""
+    # 1. Setup a fake task ticket in the active memory store
+    task_id = "fake-json-task-123"
+    TASK_STORE[task_id] = {
+        "status": "completed",
+        "json_path": "/fake/path/data.json"
+    }
+
+    fake_data = {"document": {"title": "Hello HindiScan"}}
+
+    # 2. Intercept the operating system commands so we don't need a real file
+    with patch("os.path.exists", return_value=True):
+        with patch("builtins.open", mock_open(read_data=json.dumps(fake_data))):
+            response = client.get(f"/api/v1/extract/json/{task_id}")
+
+    # 3. Assertions
+    assert response.status_code == 200
+    assert response.json() == fake_data
+
+    # Cleanup
+    TASK_STORE.pop(task_id, None)
+
+# 🚀 FIX: Removed the 'client' argument from the function signature!
+def test_get_extracted_json_not_ready():
+    """Proves the JSON endpoint blocks access if the AI is still processing."""
+    task_id = "fake-processing-task"
+    TASK_STORE[task_id] = {
+        "status": "processing", # Not 'completed' yet!
+    }
+
+    response = client.get(f"/api/v1/extract/json/{task_id}")
+
+    assert response.status_code == 400
+    assert "not ready" in response.json()["detail"]
+
+    # Cleanup
+    TASK_STORE.pop(task_id, None)
