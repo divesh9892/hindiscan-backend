@@ -5,12 +5,15 @@ import tempfile
 import asyncio
 import traceback
 import shutil
-import fitz  # 🚀 PyMuPDF Import
+import fitz
+import secrets
 from urllib.parse import quote
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks, Depends
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks, Depends, Header, Request
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
 
 from app.core.ai_extractor import AIExtractor
 from app.core.excel_builder import ExcelBuilder
@@ -18,21 +21,19 @@ from app.core.logger import log
 from app.db.database import get_db
 from app.db import crud
 from app.core.security import get_current_user
-from app.db.models import User
+from app.db.models import User, ExtractionTask # 🚀 Imported the new DB model
 
 router = APIRouter()
 
-# 🚀 1. IN-MEMORY TASK STORE (The Ticket System)
-TASK_STORE = {}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB Strict Limit
-MAX_PAGES_PER_UPLOAD = 15 # 🚀 AI Token Limit Protector
+MAX_PAGES_PER_UPLOAD = 15 
 
 class LegacyFontEnum(str, Enum):
     KRUTI_DEV_010 = "Kruti Dev 010"
     DEVLYS_010 = "DevLys 010"
 
 def cleanup_temp_dir(dir_path: str):
-    """Safely deletes the entire temporary workspace after download."""
+    """Safely deletes the entire temporary workspace."""
     try:
         if dir_path and os.path.exists(dir_path):
             shutil.rmtree(dir_path, ignore_errors=True)
@@ -41,7 +42,6 @@ def cleanup_temp_dir(dir_path: str):
         log.error(f"Failed to clean up workspace {dir_path}: {str(e)}")
 
 def build_excel_sync(json_path: str, excel_path: str, use_legacy_font: bool, legacy_font_name: str):
-    """Isolate the CPU-bound OpenPyXL Excel generation for a background thread"""
     try:
         builder = ExcelBuilder(
             json_path=json_path, 
@@ -58,25 +58,18 @@ def build_excel_sync(json_path: str, excel_path: str, use_legacy_font: bool, leg
 async def validate_magic_bytes(file: UploadFile):
     """Deep Security Check: Verifies the file's raw Magic Bytes."""
     header = await file.read(4)
-    await file.seek(0)  # Reset cursor for AI extraction
-    
+    await file.seek(0)
     is_pdf = header.startswith(b'%PDF')
     is_jpeg = header.startswith(b'\xff\xd8')
     is_png = header.startswith(b'\x89PNG')
-    
     if not (is_pdf or is_jpeg or is_png):
-        log.warning(f"Security Alert: Blocked invalid file signature for {file.filename}")
-        raise HTTPException(
-            status_code=415, 
-            detail="Security Alert: Invalid file signature. This is not a genuine Image or PDF."
-        )
+        raise HTTPException(status_code=415, detail="Security Alert: Invalid file signature. This is not a genuine Image or PDF.")
     return file.content_type
 
 def get_document_page_count(file_path: str, mime_type: str) -> int:
     """Instantly calculates the page count using PyMuPDF without using AI."""
     try:
-        if mime_type in ["image/jpeg", "image/png"]:
-            return 1 # Images are always 1 page
+        if mime_type in ["image/jpeg", "image/png"]: return 1 
         elif mime_type == "application/pdf":
             doc = fitz.open(file_path)
             count = doc.page_count
@@ -86,6 +79,17 @@ def get_document_page_count(file_path: str, mime_type: str) -> int:
     except Exception as e:
         log.error(f"Failed to read page count: {str(e)}")
         raise HTTPException(status_code=400, detail="Corrupted or unreadable document.")
+
+# 🚀 DB HELPER: Updates task state independently of the main thread
+async def update_task_state(task_id: str, **kwargs):
+    async for db in get_db():
+        result = await db.execute(select(ExtractionTask).where(ExtractionTask.id == task_id))
+        task = result.scalars().first()
+        if task:
+            for key, value in kwargs.items():
+                setattr(task, key, value)
+            await db.commit()
+        break # Ensures we only use one session
 
 # 🚀 2. THE BACKGROUND WORKER
 async def process_extraction_task(
@@ -104,34 +108,29 @@ async def process_extraction_task(
     pages_processed = 0
     excel_path = None
     export_filename = None
+    json_path = os.path.join(temp_dir, "ai_output.json") 
 
     try:
-        TASK_STORE[task_id]["progress"] = 10
-        TASK_STORE[task_id]["message"] = "AI is analyzing document layout..."
+        await update_task_state(task_id, progress=10, message="AI is analyzing document layout...")
 
-        # Progress Callback for the AI
+        # Fire-and-forget DB updates so the AI isn't slowed down
         def update_progress(current_page: int, total_pages: int):
             fraction = current_page / total_pages if total_pages > 0 else 0
-            TASK_STORE[task_id]["progress"] = int(10 + (fraction * 75))
-            TASK_STORE[task_id]["message"] = f"Processing page {current_page} of {total_pages}..."
+            prog = int(10 + (fraction * 75))
+            msg = f"Processing page {current_page} of {total_pages}..."
+            asyncio.create_task(update_task_state(task_id, progress=prog, message=msg))
 
-        # Execute AI Extraction
         extractor = AIExtractor() 
         extracted_json = await extractor.process_document(
-            doc_path, 
-            content_type, 
-            extract_tables_only,
-            progress_callback=update_progress
+            doc_path, content_type, extract_tables_only, progress_callback=update_progress
         )
 
         pages_processed = len(extracted_json.get("pages", []))
         if "pages" not in extracted_json and "document" not in extracted_json:
             raise ValueError("AI Output Error: Missing valid root keys.")
 
-        TASK_STORE[task_id]["progress"] = 90
-        TASK_STORE[task_id]["message"] = "Building Smart Excel File..."
+        await update_task_state(task_id, progress=90, message="Building Smart Excel File...")
 
-        json_path = os.path.join(temp_dir, "ai_output.json")
         ai_recommended_name = extracted_json.get("recommended_filename", "AI_Extracted_Report")
         safe_base_name = "".join(c for c in ai_recommended_name if c.isalnum() or c in (' ', '_', '-')).strip()
         export_filename = f"{safe_base_name.replace(' ', '_')}.xlsx"
@@ -142,51 +141,43 @@ async def process_extraction_task(
                 json.dump(extracted_json, f)
         await asyncio.to_thread(save_json)
 
-        # Execute Excel Build
-        await asyncio.to_thread(
-            build_excel_sync, 
-            json_path, 
-            excel_path, 
-            use_legacy_font, 
-            legacy_font_name
-        )
-
+        await asyncio.to_thread(build_excel_sync, json_path, excel_path, use_legacy_font, legacy_font_name)
         extraction_success = True
-
-    except ValueError as ve:
-        error_detail = str(ve)
-        log.error(f"Task {task_id} failed: {traceback.format_exc()}")
 
     except Exception as e:
         error_detail = str(e)
         log.error(f"Task {task_id} failed: {traceback.format_exc()}")
         
     finally:
-        # 🚀 BILLING RESOLUTION
+        # BILLING RESOLUTION
         try:
             async for db_session in get_db():
                 await crud.log_and_bill_extraction(
-                    db=db_session,
-                    user_id=user_id,
-                    original_filename=original_filename,
-                    pages=pages_processed,
-                    success=extraction_success,
+                    db=db_session, user_id=user_id, original_filename=original_filename,
+                    pages=pages_processed, success=extraction_success,
                     error_msg=error_detail if not extraction_success else None
                 )
                 break 
         except Exception as db_err:
-            log.error(f"CRITICAL BILLING FAILURE: Could not log/deduct for task {task_id}. Error: {str(db_err)}")
+            log.error(f"BILLING FAILURE for task {task_id}: {str(db_err)}")
 
-        # 🚀 2. RELEASE TICKET TO FRONTEND (Only after DB is completely finished)
+        # 🚀 THE FIX: We update the Postgres row with the TTL. No more sleep()!
+        expiration_time = datetime.now(timezone.utc) + timedelta(minutes=15)
+        
         if extraction_success:
-            TASK_STORE[task_id]["status"] = "completed"
-            TASK_STORE[task_id]["progress"] = 100
-            TASK_STORE[task_id]["message"] = "Ready for download!"
-            TASK_STORE[task_id]["excel_path"] = excel_path
-            TASK_STORE[task_id]["export_filename"] = export_filename
+            await update_task_state(
+                task_id, status="completed", progress=100, 
+                message="Ready for download! (Expires in 15 mins)",
+                excel_path=excel_path, json_path=json_path, 
+                export_filename=export_filename, expires_at=expiration_time
+            )
         else:
-            TASK_STORE[task_id]["status"] = "failed"
-            TASK_STORE[task_id]["message"] = error_detail
+            await update_task_state(
+                task_id, status="failed", message=error_detail, 
+                error_detail=error_detail, expires_at=datetime.now(timezone.utc)
+            )
+            cleanup_temp_dir(temp_dir) 
+
 # ==========================================
 # 🚀 ENDPOINT 1: START EXTRACTION
 # ==========================================
@@ -197,14 +188,11 @@ async def start_extraction(
     extract_tables_only: bool = Form(False),
     use_legacy_font: bool = Form(False),
     legacy_font_name: LegacyFontEnum = Form(LegacyFontEnum.KRUTI_DEV_010),
-    user: User = Depends(get_current_user)
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
-    # Quick fail-fast if completely empty
-    if user.credit_balance < 1:
-        raise HTTPException(status_code=402, detail="Insufficient credits. Please top up your balance.")
-
-    if file.size and file.size > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File exceeds the 5MB strict limit.")
+    if user.credit_balance < 1: raise HTTPException(status_code=402, detail="Insufficient credits. Please top up your balance.")
+    if file.size and file.size > MAX_FILE_SIZE: raise HTTPException(status_code=413, detail="File exceeds 5MB limit.")
 
     await validate_magic_bytes(file)
 
@@ -213,84 +201,234 @@ async def start_extraction(
     clean_original_filename = file.filename.replace(" ", "_")
     doc_path = os.path.join(temp_dir, clean_original_filename)
 
-    with open(doc_path, "wb") as buffer:
-        buffer.write(await file.read())
-
-    # 🚀 PRE-FLIGHT CHECKS
+    with open(doc_path, "wb") as buffer: buffer.write(await file.read())
     total_pages = get_document_page_count(doc_path, file.content_type)
 
     if total_pages > MAX_PAGES_PER_UPLOAD:
         shutil.rmtree(temp_dir, ignore_errors=True)
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Document has {total_pages} pages. To ensure high AI accuracy, the maximum allowed is {MAX_PAGES_PER_UPLOAD} pages per scan. Please split your file."
-        )
+        raise HTTPException(status_code=400, detail=f"Maximum allowed is {MAX_PAGES_PER_UPLOAD} pages per scan.")
 
     if user.credit_balance < total_pages:
         shutil.rmtree(temp_dir, ignore_errors=True)
-        raise HTTPException(
-            status_code=402, 
-            detail=f"You are trying to extract {total_pages} pages, but you only have {user.credit_balance} credits available. Please top up your balance."
-        )
+        raise HTTPException(status_code=402, detail=f"You are trying to extract {total_pages} pages, but you only have {user.credit_balance} credits available. Please top up your balance")
 
-    TASK_STORE[task_id] = {
-        "status": "processing",
-        "progress": 0,
-        "message": "Initializing...",
-        "temp_dir": temp_dir
-    }
+    # 🚀 Create Task in DB instead of RAM
+    new_task = ExtractionTask(
+        id=task_id, user_id=user.id, temp_dir=temp_dir,
+        status="processing", progress=0, message="Initializing..."
+    )
+    db.add(new_task)
+    await db.commit()
 
     background_tasks.add_task(
-        process_extraction_task,
-        task_id=task_id,
-        user_id=user.id,
-        doc_path=doc_path,
-        content_type=file.content_type,
-        original_filename=clean_original_filename,
-        extract_tables_only=extract_tables_only,
-        use_legacy_font=use_legacy_font,
-        legacy_font_name=legacy_font_name.value,
-        temp_dir=temp_dir
+        process_extraction_task, task_id, user.id, doc_path, file.content_type,
+        clean_original_filename, extract_tables_only, use_legacy_font, legacy_font_name.value, temp_dir
     )
 
     return {"task_id": task_id}
 
 # ==========================================
-# 🚀 ENDPOINT 2: STATUS CHECKER
+# 🚀 ENDPOINT 2, 3, 4: AUTHENTICATED FETCH
 # ==========================================
+async def get_secure_task(task_id: str, user_id: int, db: AsyncSession):
+    """Loophole Closed: Enforces database ownership before returning files."""
+    result = await db.execute(select(ExtractionTask).where(ExtractionTask.id == task_id))
+    task = result.scalars().first()
+    
+    if not task: raise HTTPException(status_code=404, detail="Task not found.")
+    if task.user_id != user_id: raise HTTPException(status_code=403, detail="Unauthorized.")
+    
+    # Check if the cron job missed it, but it mathematically expired
+    if task.expires_at and task.expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=410, detail="This file has expired and been securely shredded.")
+        
+    return task
+
 @router.get("/status/{task_id}")
-async def get_task_status(task_id: str):
-    task = TASK_STORE.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found or expired.")
-    
-    return {
-        "status": task["status"],
-        "progress": task["progress"],
-        "message": task["message"]
-    }
+async def get_task_status(task_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    task = await get_secure_task(task_id, user.id, db)
+    return {"status": task.status, "progress": task.progress, "message": task.message}
 
-# ==========================================
-# 🚀 ENDPOINT 3: DOWNLOAD & CLEANUP
-# ==========================================
+@router.get("/json/{task_id}")
+async def get_extracted_json(task_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    task = await get_secure_task(task_id, user.id, db)
+    if task.status != "completed": raise HTTPException(status_code=400, detail="Data is not ready.")
+    if not task.json_path or not os.path.exists(task.json_path): raise HTTPException(status_code=404, detail="JSON not found.")
+
+    def read_json():
+        with open(task.json_path, 'r', encoding='utf-8') as f: return json.load(f)
+    return await asyncio.to_thread(read_json)
+
 @router.get("/download/{task_id}")
-async def download_extracted_file(task_id: str, background_tasks: BackgroundTasks):
-    task = TASK_STORE.get(task_id)
-    
-    if not task or task.get("status") != "completed":
-        raise HTTPException(status_code=400, detail="File is not ready yet.")
+async def download_extracted_file(task_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    task = await get_secure_task(task_id, user.id, db)
+    if task.status != "completed": raise HTTPException(status_code=400, detail="File is not ready.")
+    if not task.excel_path or not os.path.exists(task.excel_path): raise HTTPException(status_code=410, detail="File deleted.")
 
-    excel_path = task["excel_path"]
-    export_filename = task["export_filename"]
-    temp_dir = task["temp_dir"]
-
-    # Schedule complete workspace destruction AFTER file transmits
-    background_tasks.add_task(cleanup_temp_dir, temp_dir)
-    TASK_STORE.pop(task_id, None)
-
-    encoded_filename = quote(export_filename)
+    encoded_filename = quote(task.export_filename)
     return FileResponse(
-        path=excel_path, 
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        path=task.excel_path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={'Content-Disposition': f"attachment; filename*=utf-8''{encoded_filename}"}
     )
+
+# ==========================================
+# 🚀 ENDPOINT 5: THE GARBAGE COLLECTOR
+# ==========================================
+@router.post("/garbage-collect")
+async def trigger_garbage_collection(
+    x_cron_secret: str = Header(None), 
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Secure endpoint to be pinged by cron-job.org every 5 minutes.
+    Sweeps the database for expired tasks, shreds their files, and deletes the rows.
+    """
+    expected_secret = os.getenv("CRON_SECRET", "dev_secret_123")
+    
+    # Time-safe comparison prevents hackers from guessing the password via timing attacks
+    if not x_cron_secret or not secrets.compare_digest(x_cron_secret, expected_secret):
+        log.warning("Unauthorized garbage collection attempt blocked.")
+        raise HTTPException(status_code=403, detail="Invalid cron secret.")
+
+    log.info("🧹 Initiating Database-Backed Garbage Collection...")
+    
+    # Find all tasks that have expired
+    result = await db.execute(
+        select(ExtractionTask).where(ExtractionTask.expires_at <= datetime.now(timezone.utc))
+    )
+    expired_tasks = result.scalars().all()
+    
+    count = 0
+    for task in expired_tasks:
+        cleanup_temp_dir(task.temp_dir)
+        await db.delete(task)
+        count += 1
+        
+    await db.commit()
+    log.info(f"✨ Garbage Collection Complete. Shredded {count} expired tasks.")
+    
+    return {"status": "success", "shredded_count": count}
+
+# ==========================================
+# 🚀 ENDPOINT 6: MANUAL JSON TO EXCEL
+# ==========================================
+@router.post("/manual/")
+async def generate_manual_excel(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user)
+):
+    """
+    Instantly generates an Excel file from raw JSON.
+    Used when a user edits the JSON in the frontend Success Hub.
+    """
+    try:
+        body = await request.json()
+        
+        # 1. Isolate the target data
+        json_data = body.get("json_data", body) if isinstance(body, dict) else body
+        
+        # 2. Deep Unwrapper for double-stringified JSON
+        parse_attempts = 0
+        while isinstance(json_data, str) and parse_attempts < 5:
+            try:
+                json_data = json.loads(json_data)
+                parse_attempts += 1
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=400, detail="Provided JSON string is malformed and cannot be parsed.")
+
+        if not isinstance(json_data, dict):
+            raise HTTPException(status_code=400, detail=f"Expected a JSON object, but received a {type(json_data).__name__}.")
+
+        # 3. Intelligent Parent Unwrapping
+        if "pages" not in json_data and "document" not in json_data:
+            if "data" in json_data and isinstance(json_data["data"], dict):
+                json_data = json_data["data"]
+            elif "payload" in json_data and isinstance(json_data["payload"], dict):
+                json_data = json_data["payload"]
+            else:
+                raise HTTPException(status_code=400, detail="JSON must contain a 'pages' or 'document' root key. Check your JSON hierarchy.")
+
+        # 🚀 4. THE FIX: Aggressive Filename Extraction (AFTER parsing is complete)
+        ai_recommended_name = None
+        
+        # Location A: Top level of the request body
+        if isinstance(body, dict) and body.get("recommended_filename"):
+            ai_recommended_name = body.get("recommended_filename")
+            
+        # Location B: Inside the fully parsed json_data object
+        if not ai_recommended_name and isinstance(json_data, dict) and json_data.get("recommended_filename"):
+            ai_recommended_name = json_data.get("recommended_filename")
+            
+        # Location C: Nested inside the first page (standard Gemini output)
+        if not ai_recommended_name and isinstance(json_data, dict):
+            pages = json_data.get("pages", [])
+            if isinstance(pages, list) and len(pages) > 0 and isinstance(pages[0], dict):
+                ai_recommended_name = pages[0].get("recommended_filename")
+                
+        # Safety Net Fallback
+        if not ai_recommended_name or not str(ai_recommended_name).strip():
+            ai_recommended_name = "Manual_Export"
+
+        # 5. Extract configuration safely
+        use_legacy_font = False
+        legacy_font_name = LegacyFontEnum.KRUTI_DEV_010.value
+        
+        if isinstance(body, dict):
+            legacy_str = str(body.get("use_legacy_font", "false")).lower()
+            use_legacy_font = legacy_str in ["true", "1", "yes"]
+            legacy_font_name = body.get("legacy_font_name", legacy_font_name)
+
+        # 6. Setup Secure Temporary Workspace
+        task_id = str(uuid.uuid4())
+        temp_dir = tempfile.mkdtemp(prefix=f"hs_manual_{task_id}_")
+        json_path = os.path.join(temp_dir, "manual_input.json")
+        
+        # Clean the filename to prevent OS path errors
+        safe_base_name = "".join(c for c in str(ai_recommended_name) if c.isalnum() or c in (' ', '_', '-')).strip()
+        if not safe_base_name:
+            safe_base_name = "Manual_Export"
+            
+        export_filename = f"{safe_base_name.replace(' ', '_')}.xlsx"
+        excel_path = os.path.join(temp_dir, export_filename)
+
+        # 7. Write parsed JSON to disk
+        def save_json():
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(json_data, f, ensure_ascii=False)
+        await asyncio.to_thread(save_json)
+
+        # 8. Build Excel synchronously in a separate thread
+        await asyncio.to_thread(
+            build_excel_sync, 
+            json_path, 
+            excel_path, 
+            use_legacy_font, 
+            legacy_font_name
+        )
+
+        if not os.path.exists(excel_path):
+            raise RuntimeError("ExcelBuilder failed silently and did not produce an output file.")
+
+        # 9. Schedule instant cleanup
+        background_tasks.add_task(cleanup_temp_dir, temp_dir)
+
+        log.info(f"Successfully generated manual Excel: {export_filename}")
+
+        # 10. Stream the file directly back to the user
+        encoded_filename = quote(export_filename)
+        return FileResponse(
+            path=excel_path, 
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={'Content-Disposition': f"attachment; filename*=utf-8''{encoded_filename}"}
+        )
+
+    except HTTPException as he:
+        if 'temp_dir' in locals():
+            cleanup_temp_dir(temp_dir)
+        raise he
+    except Exception as e:
+        log.error(f"Manual Excel generation failed for user {user.email}: {str(e)}")
+        if 'temp_dir' in locals():
+            cleanup_temp_dir(temp_dir)
+        raise HTTPException(status_code=500, detail="Failed to build Excel from manual data.")
