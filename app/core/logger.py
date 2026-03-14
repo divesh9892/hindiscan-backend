@@ -1,9 +1,14 @@
 import logging
 import sys
+import contextvars
 from colorama import init, Fore, Style
 
 # Initialize colorama to ensure Windows terminals render ANSI colors correctly
 init(autoreset=True)
+
+# 🚀 THE VAULT: This creates an isolated memory bubble for the current async task.
+# Defaults to "System" for background tasks or server startup logs.
+request_user_ctx = contextvars.ContextVar("request_user", default="System")
 
 class ColoredFormatter(logging.Formatter):
     """Custom logging formatter injecting Colorama ANSI codes based on log level."""
@@ -19,16 +24,27 @@ class ColoredFormatter(logging.Formatter):
     def format(self, record):
         log_color = self.COLORS.get(record.levelno, Fore.WHITE)
         
-        # Format: [TIMESTAMP] - [LEVEL] - [FILE:LINE] - MESSAGE
+        # 🚀 Fetch the highly-isolated user context
+        current_user = request_user_ctx.get()
+        
+        # Format: [TIMESTAMP] - [LEVEL] - [USER] - [FILE:LINE] - MESSAGE
         format_str = (
             f"{Fore.LIGHTBLACK_EX}%(asctime)s{Style.RESET_ALL} - "
             f"{log_color}%(levelname)s{Style.RESET_ALL} - "
+            f"{Fore.MAGENTA}[{current_user}]{Style.RESET_ALL} - " # 🚀 Injects the user in Magenta
             f"{Fore.LIGHTBLUE_EX}[%(filename)s:%(lineno)d]{Style.RESET_ALL} - "
             f"{log_color}%(message)s{Style.RESET_ALL}"
         )
         
         formatter = logging.Formatter(format_str, datefmt="%Y-%m-%d %H:%M:%S")
         return formatter.format(record)
+
+class PlainContextFormatter(logging.Formatter):
+    """Ensures the plain file logger also gets the dynamic context without ANSI garbage."""
+    def format(self, record):
+        current_user = request_user_ctx.get()
+        self._style._fmt = f'%(asctime)s - %(levelname)s - [{current_user}] - [%(filename)s:%(lineno)d] - %(message)s'
+        return super().format(record)
 
 def setup_logger(name="HindiExtractor", log_file="app.log"):
     """Sets up a robust enterprise logger with dual outputs (Colored Console + Plain File)."""
@@ -44,9 +60,8 @@ def setup_logger(name="HindiExtractor", log_file="app.log"):
         logger.addHandler(ch)
         
         # 2. File Handler (Plain text to avoid ANSI garbage characters in the file)
-        plain_formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
         fh = logging.FileHandler(log_file, encoding='utf-8')
-        fh.setFormatter(plain_formatter)
+        fh.setFormatter(PlainContextFormatter())
         logger.addHandler(fh)
         
     return logger
