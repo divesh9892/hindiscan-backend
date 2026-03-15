@@ -30,7 +30,7 @@ jobs:
           CLERK_SECRET_KEY: "test_key"
           CLERK_PUBLIC_KEY: "test_key"
           GEMINI_API_KEY: "test_key"
-          DATABASE_URL: "sqlite+aiosqlite:///:memory:"
+          DATABASE_URL: "postgresql+asyncpg://fake_user:fake_password@localhost:5432/fake_db"
           USE_MOCK_PAYMENTS: "True"
         run: |
           pytest -v
