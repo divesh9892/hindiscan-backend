@@ -1,14 +1,13 @@
 import pytest
+import json
 from fastapi.testclient import TestClient
 from unittest.mock import patch, AsyncMock, MagicMock, mock_open
-from app.core.security import get_current_user
-from app.db.models import User
-from app.db.database import get_db  
-import json
-from app.api.v1.endpoints.extract import TASK_STORE
 
-# Import your FastAPI app
 from app.main import app
+from app.core.security import get_current_user
+from app.db.models import User, ExtractionTask
+from app.db.database import get_db
+
 # Create a test client that acts like a browser
 client = TestClient(app)
 
@@ -16,14 +15,14 @@ client = TestClient(app)
 def mock_get_current_user():
     return User(id=999, clerk_id="test_robot_123", email="robot@hindiscan.com", credit_balance=10)
 
-# 🚀 DATABASE BYPASS: Fake the Database Session
+# 🚀 DATABASE BYPASS: Fake the Database Session for API routing
 async def mock_get_db():
     mock_db = AsyncMock()
-    # Tell the mock that .add() is synchronous, so it stops throwing warnings!
+    # Tell the mock that .add() is synchronous, so it stops throwing warnings
     mock_db.add = MagicMock() 
     yield mock_db
 
-# 🚀 FIX: Safely apply overrides per-test so they don't break other files
+# Safely apply overrides per-test so they don't break other files
 @pytest.fixture(autouse=True)
 def apply_auth_overrides():
     app.dependency_overrides[get_current_user] = mock_get_current_user
@@ -56,17 +55,22 @@ def mock_gemini_response():
         ]
     }
 
-# 🚀 MOCKING: We intercept the AI Extractor before it talks to Google
+# ==========================================
+# 🚀 POST EXTRACTION TESTS
+# ==========================================
+
+# MOCKING: Intercept the AI, the init, AND the background database writer to keep tests purely isolated
 @patch("app.api.v1.endpoints.extract.AIExtractor.process_document", new_callable=AsyncMock)
 @patch("app.api.v1.endpoints.extract.AIExtractor.__init__", return_value=None) 
-def test_extract_endpoint_success(mock_init, mock_process_document, mock_gemini_response):
+@patch("app.api.v1.endpoints.extract.update_task_state", new_callable=AsyncMock) 
+def test_extract_endpoint_success(mock_update_state, mock_init, mock_process_document, mock_gemini_response):
     """
     Simulates a user uploading a valid JPEG.
     Ensures the API passes the Vault and returns a Ticket ID.
     """
     mock_process_document.return_value = mock_gemini_response
 
-    # 🚀 FIX: Inject genuine JPEG Magic Bytes so the Vault lets it through
+    # Inject genuine JPEG Magic Bytes so the Vault lets it through
     valid_jpeg_bytes = b'\xff\xd8\xff\xe0\x00\x10JFIF\x00' + b'fake_data'
     files = {"file": ("test_upload.jpeg", valid_jpeg_bytes, "image/jpeg")}
     data = {
@@ -77,7 +81,6 @@ def test_extract_endpoint_success(mock_init, mock_process_document, mock_gemini_
 
     response = client.post("/api/v1/extract/", files=files, data=data)
 
-    # 🚀 FIX: We now expect a 200 OK and a task_id ticket, NOT the direct file!
     assert response.status_code == 200, f"Expected 200 OK, got {response.status_code}. Detail: {response.text}"
     assert "task_id" in response.json()
 
@@ -92,19 +95,27 @@ def test_extract_endpoint_invalid_file_type():
 
     response = client.post("/api/v1/extract/", files=files, data=data)
 
-    # 🚀 FIX: Our vault now throws a strict 415 Unsupported Media Type, not a generic 400
+    # Our vault now throws a strict 415 Unsupported Media Type
     assert response.status_code == 415
 
+# ==========================================
+# 🚀 GET JSON ENDPOINT TESTS
+# ==========================================
 
-# 🚀 FIX: Removed the 'client' argument from the function signature!
-def test_get_extracted_json_success():
-    """Proves the JSON endpoint successfully returns parsed data."""
-    # 1. Setup a fake task ticket in the active memory store
+# THE FIX: Intercept the new `get_secure_task` DB function to return a fake Postgres Row
+@patch("app.api.v1.endpoints.extract.get_secure_task", new_callable=AsyncMock)
+def test_get_extracted_json_success(mock_get_secure_task):
+    """Proves the JSON endpoint successfully returns parsed data for an authorized user."""
+    
+    # 1. Setup a fake task row using the new SQLAlchemy model
     task_id = "fake-json-task-123"
-    TASK_STORE[task_id] = {
-        "status": "completed",
-        "json_path": "/fake/path/data.json"
-    }
+    fake_task = ExtractionTask(
+        id=task_id, 
+        user_id=999, 
+        status="completed", 
+        json_path="/fake/path/data.json"
+    )
+    mock_get_secure_task.return_value = fake_task
 
     fake_data = {"document": {"title": "Hello HindiScan"}}
 
@@ -117,21 +128,21 @@ def test_get_extracted_json_success():
     assert response.status_code == 200
     assert response.json() == fake_data
 
-    # Cleanup
-    TASK_STORE.pop(task_id, None)
 
-# 🚀 FIX: Removed the 'client' argument from the function signature!
-def test_get_extracted_json_not_ready():
+@patch("app.api.v1.endpoints.extract.get_secure_task", new_callable=AsyncMock)
+def test_get_extracted_json_not_ready(mock_get_secure_task):
     """Proves the JSON endpoint blocks access if the AI is still processing."""
+    
+    # Create a task that is still in the "processing" state
     task_id = "fake-processing-task"
-    TASK_STORE[task_id] = {
-        "status": "processing", # Not 'completed' yet!
-    }
+    fake_task = ExtractionTask(
+        id=task_id, 
+        user_id=999, 
+        status="processing"
+    )
+    mock_get_secure_task.return_value = fake_task
 
     response = client.get(f"/api/v1/extract/json/{task_id}")
 
     assert response.status_code == 400
     assert "not ready" in response.json()["detail"]
-
-    # Cleanup
-    TASK_STORE.pop(task_id, None)
