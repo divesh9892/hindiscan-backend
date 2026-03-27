@@ -33,7 +33,7 @@ async def get_current_user(
 
     # --- 1. LOCAL CRYPTOGRAPHIC VALIDATION ---
     try:
-        payload = jwt.decode(token, key=CLERK_PUBLIC_KEY, algorithms=["RS256"])
+        payload = jwt.decode(token, key=CLERK_PUBLIC_KEY, algorithms=["RS256"], leeway=120)
         clerk_id = payload.get("sub") 
         if not clerk_id:
             raise HTTPException(status_code=401, detail="Invalid token payload.")
@@ -101,7 +101,7 @@ async def get_admin_user(
     token = credentials.credentials
     
     try:
-        payload = jwt.decode(token, key=CLERK_PUBLIC_KEY, algorithms=["RS256"])
+        payload = jwt.decode(token, key=CLERK_PUBLIC_KEY, algorithms=["RS256"], leeway=120)
         clerk_id = payload.get("sub")
         if not clerk_id:
             raise HTTPException(status_code=401, detail="Invalid token payload.")
