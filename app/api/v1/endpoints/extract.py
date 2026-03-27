@@ -98,6 +98,7 @@ async def process_extraction_task(
     doc_path: str, 
     content_type: str,
     original_filename: str,
+    total_pages: int,
     extract_tables_only: bool,
     use_legacy_font: bool,
     legacy_font_name: str,
@@ -149,17 +150,16 @@ async def process_extraction_task(
         log.error(f"Task {task_id} failed: {traceback.format_exc()}")
         
     finally:
-        # BILLING RESOLUTION
+        # 🚀 ENTERPRISE BILLING RESOLUTION
         try:
             async for db_session in get_db():
-                await crud.log_and_bill_extraction(
-                    db=db_session, user_id=user_id, original_filename=original_filename,
-                    pages=pages_processed, success=extraction_success,
-                    error_msg=error_detail if not extraction_success else None
-                )
+                if extraction_success:
+                    await crud.log_successful_extraction(db_session, user_id, original_filename, total_pages)
+                else:
+                    await crud.refund_credits(db_session, user_id, total_pages, original_filename, error_detail)
                 break 
         except Exception as db_err:
-            log.error(f"BILLING FAILURE for task {task_id}: {str(db_err)}")
+            log.error(f"BILLING RESOLUTION FAILURE for task {task_id}: {str(db_err)}")
 
         # 🚀 THE FIX: We update the Postgres row with the TTL. No more sleep()!
         expiration_time = datetime.now(timezone.utc) + timedelta(minutes=15)
@@ -191,28 +191,36 @@ async def start_extraction(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    if user.credit_balance < 1: raise HTTPException(status_code=402, detail="Insufficient credits. Please top up your balance.")
-    if file.size and file.size > MAX_FILE_SIZE: raise HTTPException(status_code=413, detail="File exceeds 5MB limit.")
+    if file.size and file.size > MAX_FILE_SIZE: 
+        raise HTTPException(status_code=413, detail="File exceeds 5MB limit.")
 
     await validate_magic_bytes(file)
 
     task_id = str(uuid.uuid4())
     temp_dir = tempfile.mkdtemp(prefix=f"hs_{task_id}_")
-    clean_original_filename = file.filename.replace(" ", "_")
+    
+    # 🚀 PATH TRAVERSAL FIX: Strip malicious folder paths from the filename
+    safe_filename = os.path.basename(file.filename)
+    clean_original_filename = safe_filename.replace(" ", "_")
     doc_path = os.path.join(temp_dir, clean_original_filename)
 
-    with open(doc_path, "wb") as buffer: buffer.write(await file.read())
+    with open(doc_path, "wb") as buffer: 
+        buffer.write(await file.read())
+        
     total_pages = get_document_page_count(doc_path, file.content_type)
 
     if total_pages > MAX_PAGES_PER_UPLOAD:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=f"Maximum allowed is {MAX_PAGES_PER_UPLOAD} pages per scan.")
 
-    if user.credit_balance < total_pages:
+    # 🚀 DOUBLE-SPEND FIX: Lock row and deduct credits UPFRONT
+    charged_successfully = await crud.charge_credits_upfront(db, user.id, total_pages, clean_original_filename)
+    
+    if not charged_successfully:
         shutil.rmtree(temp_dir, ignore_errors=True)
-        raise HTTPException(status_code=402, detail=f"You are trying to extract {total_pages} pages, but you only have {user.credit_balance} credits available. Please top up your balance")
+        raise HTTPException(status_code=402, detail=f"Insufficient credits. This document requires {total_pages} credits.")
 
-    # 🚀 Create Task in DB instead of RAM
+    # Create Task in DB
     new_task = ExtractionTask(
         id=task_id, user_id=user.id, temp_dir=temp_dir,
         status="processing", progress=0, message="Initializing..."
@@ -220,9 +228,10 @@ async def start_extraction(
     db.add(new_task)
     await db.commit()
 
+    # Pass the total_pages parameter we added earlier to the background task
     background_tasks.add_task(
         process_extraction_task, task_id, user.id, doc_path, file.content_type,
-        clean_original_filename, extract_tables_only, use_legacy_font, legacy_font_name.value, temp_dir
+        clean_original_filename, total_pages, extract_tables_only, use_legacy_font, legacy_font_name.value, temp_dir
     )
 
     return {"task_id": task_id}

@@ -25,60 +25,75 @@ async def get_or_create_dev_user(db: AsyncSession, email: str = "dev@hindiscan.c
         
     return user
 
-async def log_and_bill_extraction(
-    db: AsyncSession, 
-    user_id: int, 
-    original_filename: str, 
-    pages: int, 
-    success: bool, 
-    error_msg: str = None
-):
+async def charge_credits_upfront(db: AsyncSession, user_id: int, amount: int, reference_id: str) -> bool:
     """
-    Atomic transaction: Logs the extraction attempt. 
-    If successful, safely deducts 1 credit PER PAGE and logs the transaction.
+    ENTERPRISE FIX: Row-Level Locking (SELECT ... FOR UPDATE).
+    Locks the user's wallet, checks the balance, and deducts the deposit immediately.
     """
     try:
-        # 1. Create the receipt for the extraction
-        extraction_log = ExtractionLog(
-            user_id=user_id,
-            original_filename=original_filename,
-            pages_processed=pages,
-            status="success" if success else "failed",
-            error_message=error_msg
+        result = await db.execute(
+            select(User).where(User.id == user_id).with_for_update()
         )
-        db.add(extraction_log)
-
-        # 2. Only deduct credits if extraction was 100% successful AND pages exist
-        if success and pages > 0:
-            # 🚀 Calculate the total cost (1 credit per page)
-            total_cost = pages * 1 
-
-            # 🚀 ENTERPRISE UPGRADE: Row-Level Locking
-            result = await db.execute(
-                select(User).where(User.id == user_id).with_for_update()
-            )
-            user = result.scalars().first()
+        user = result.scalars().first()
+        
+        if not user or user.credit_balance < amount:
+            return False # Insufficient funds or user not found
             
-            if user:
-                # Deduct the dynamic total cost
-                user.credit_balance -= total_cost 
-                
-                tx = CreditTransaction(
-                    user_id=user_id, 
-                    amount=-total_cost, # Log the dynamic total cost
-                    transaction_type="extraction_deduction",
-                    reference_id=original_filename
-                )
-                db.add(tx)
-
-        # 3. Commit EVERYTHING together
+        user.credit_balance -= amount 
+        
+        tx = CreditTransaction(
+            user_id=user_id, 
+            amount=-amount,
+            transaction_type="extraction_deduction",
+            reference_id=reference_id
+        )
+        db.add(tx)
         await db.commit()
         return True
-
     except Exception as e:
-        log.error(f"Database Transaction Failed: {str(e)}")
-        await db.rollback() # 🚀 The ACID Rollback! Protects the user's money.
+        log.error(f"Upfront charge failed: {str(e)}")
+        await db.rollback()
         raise e
+
+async def refund_credits(db: AsyncSession, user_id: int, amount: int, reference_id: str, error_msg: str):
+    """Refunds the deposit if the background AI task fails."""
+    try:
+        result = await db.execute(select(User).where(User.id == user_id).with_for_update())
+        user = result.scalars().first()
+        
+        if user:
+            user.credit_balance += amount
+            tx = CreditTransaction(
+                user_id=user_id,
+                amount=amount,
+                transaction_type="refund",
+                reference_id=f"Refund: {reference_id}"
+            )
+            db.add(tx)
+
+        # Log the failure
+        extraction_log = ExtractionLog(
+            user_id=user_id, original_filename=reference_id,
+            pages_processed=amount, status="failed", error_message=error_msg
+        )
+        db.add(extraction_log)
+        await db.commit()
+    except Exception as e:
+        log.error(f"Refund failed: {str(e)}")
+        await db.rollback()
+
+async def log_successful_extraction(db: AsyncSession, user_id: int, original_filename: str, pages: int):
+    """Logs a successful extraction (credits were already deducted upfront)."""
+    try:
+        extraction_log = ExtractionLog(
+            user_id=user_id, original_filename=original_filename,
+            pages_processed=pages, status="success", error_message=None
+        )
+        db.add(extraction_log)
+        await db.commit()
+    except Exception as e:
+        log.error(f"Success logging failed: {str(e)}")
+        await db.rollback()
 
 async def get_user_transactions(
     db: AsyncSession, 
