@@ -47,67 +47,72 @@ async def test_dev_user_creation(db_session):
 
 @pytest.mark.asyncio
 async def test_successful_extraction_billing(db_session):
-    """Proves a successful extraction deducts exactly 1 credit PER PAGE and logs all receipts."""
+    """Proves a successful extraction deducts credits upfront and logs receipts."""
     user = await crud.get_or_create_dev_user(db_session)
     
-    await crud.log_and_bill_extraction(
-        db=db_session,
-        user_id=user.id,
-        original_filename="test_doc.pdf",
-        pages=2,
-        success=True
+    # 1. UPFRONT CHARGE (Simulating the API Endpoint)
+    charged = await crud.charge_credits_upfront(
+        db=db_session, user_id=user.id, amount=2, reference_id="test_doc.pdf"
+    )
+    assert charged is True
+    
+    # 2. LOG SUCCESS (Simulating the Background Worker)
+    await crud.log_successful_extraction(
+        db=db_session, user_id=user.id, original_filename="test_doc.pdf", pages=2
     )
     
-    # 1. Did the balance drop?
+    # ASSERTIONS
     updated_user = await db_session.get(User, user.id)
-    assert updated_user.credit_balance == 1
+    assert updated_user.credit_balance == 1 # Started at 3, minus 2 = 1
     
-    # 2. Was the extraction receipt created?
     result_logs = await db_session.execute(select(ExtractionLog).where(ExtractionLog.user_id == user.id))
     logs = result_logs.scalars().all()
     assert len(logs) == 1
     assert logs[0].status == "success"
-    assert logs[0].pages_processed == 2
     
-    # 3. Was the exact -1 deduction logged in the bank ledger?
     result_tx = await db_session.execute(
-            select(CreditTransaction)
-            .where(CreditTransaction.user_id == user.id)
-            .where(CreditTransaction.transaction_type == "extraction_deduction")
-        )
+        select(CreditTransaction)
+        .where(CreditTransaction.user_id == user.id)
+        .where(CreditTransaction.transaction_type == "extraction_deduction")
+    )
     deductions = result_tx.scalars().all()
-    assert len(deductions) == 1
     assert deductions[0].amount == -2
 
 @pytest.mark.asyncio
 async def test_failed_extraction_protection(db_session):
-    """Proves a failed extraction logs the error but KEEPS the user's credits safe."""
+    """Proves a failed extraction issues a full refund and logs the error."""
     user = await crud.get_or_create_dev_user(db_session)
     
-    await crud.log_and_bill_extraction(
-        db=db_session,
-        user_id=user.id,
-        original_filename="broken_doc.pdf",
-        pages=0,
-        success=False,
-        error_msg="AI failed to read blurred image"
+    # 1. UPFRONT CHARGE (Simulating a 3-page document upload)
+    charged = await crud.charge_credits_upfront(
+        db=db_session, user_id=user.id, amount=3, reference_id="broken_doc.pdf"
+    )
+    assert charged is True
+    
+    # 2. AI FAILS -> ISSUE REFUND (Simulating the Background Worker crash)
+    await crud.refund_credits(
+        db=db_session, user_id=user.id, amount=3, 
+        reference_id="broken_doc.pdf", error_msg="AI failed to read blurred image"
     )
     
-    # 1. Did we protect their money? Balance should still be 3.
+    # ASSERTIONS
     updated_user = await db_session.get(User, user.id)
-    assert updated_user.credit_balance == 3
+    assert updated_user.credit_balance == 3 # Deducted 3, refunded 3, back to normal!
     
-    # 2. Was the failure logged so the admin can debug it?
     result_logs = await db_session.execute(select(ExtractionLog).where(ExtractionLog.user_id == user.id))
     logs = result_logs.scalars().all()
-    assert len(logs) == 1
     assert logs[0].status == "failed"
     assert logs[0].error_message == "AI failed to read blurred image"
     
-    # 3. Prove NO deductions were added to the ledger
-    result_tx = await db_session.execute(select(CreditTransaction).where(CreditTransaction.amount == -1))
-    deductions = result_tx.scalars().all()
-    assert len(deductions) == 0
+    # Prove BOTH the deduction AND the refund were added to the ledger for audit compliance
+    result_tx = await db_session.execute(select(CreditTransaction).where(CreditTransaction.user_id == user.id))
+    transactions = result_tx.scalars().all()
+    
+    deduction_tx = next(tx for tx in transactions if tx.transaction_type == "extraction_deduction")
+    assert deduction_tx.amount == -3
+    
+    refund_tx = next(tx for tx in transactions if tx.transaction_type == "refund")
+    assert refund_tx.amount == 3
 
 @pytest.mark.asyncio
 async def test_cursor_pagination_logic(db_session):

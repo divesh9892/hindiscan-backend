@@ -32,8 +32,15 @@ def apply_auth_overrides():
 
 @pytest.fixture(autouse=True)
 def bypass_billing_for_api_tests():
-    with patch("app.api.v1.endpoints.extract.crud.log_and_bill_extraction", new_callable=AsyncMock) as mock_billing:
-        yield mock_billing
+    """Mocks the new 3-step enterprise billing architecture so API tests run in isolation."""
+    with patch("app.api.v1.endpoints.extract.crud.charge_credits_upfront", new_callable=AsyncMock) as mock_charge, \
+         patch("app.api.v1.endpoints.extract.crud.refund_credits", new_callable=AsyncMock) as mock_refund, \
+         patch("app.api.v1.endpoints.extract.crud.log_successful_extraction", new_callable=AsyncMock) as mock_log_success:
+        
+        # 🚀 Force the mock charge to succeed so the API allows the upload
+        mock_charge.return_value = True 
+        
+        yield {"charge": mock_charge, "refund": mock_refund, "log": mock_log_success}
 
 @pytest.fixture
 def mock_gemini_response():
