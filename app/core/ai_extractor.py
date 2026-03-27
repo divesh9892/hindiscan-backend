@@ -32,13 +32,28 @@ class AIExtractor:
         return clean_text
 
     def _slice_pdf_sync(self, file_path):
-        """CPU-Bound task isolated for background threading"""
+        """CPU-Bound task isolated for background threading with strict memory management"""
         images = []
-        with fitz.open(file_path) as doc:
+        doc = None
+        try:
+            doc = fitz.open(file_path)
             for page_num in range(len(doc)):
                 page = doc.load_page(page_num)
                 pix = page.get_pixmap(dpi=150) 
                 images.append(pix.tobytes("jpeg"))
+                
+                # 🚀 ENTERPRISE FIX: Force Python to instantly release the 10MB+ pixel map
+                del pix 
+                del page
+                
+        except Exception as e:
+            log.error(f"PyMuPDF Exception: {str(e)}")
+            raise e
+        finally:
+            # 🚀 ENTERPRISE FIX: Guarantee the C-level memory bindings are destroyed
+            if doc:
+                doc.close()
+                
         return images
 
     def _api_call_sync(self, full_prompt, document_part):
