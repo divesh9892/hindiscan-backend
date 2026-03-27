@@ -102,6 +102,7 @@ class ExtractionTask(Base):
     
     # Lifecycle Management (For the Garbage Collector)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    expires_at = Column(DateTime(timezone=True), nullable=True) 
+    # 🚀 FIX: Added index=True to prevent Sequential Scans during Garbage Collection
+    expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
 
     user = relationship("User", backref="extraction_tasks")
